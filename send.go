@@ -1126,16 +1126,110 @@ func (cli *Client) getMessageContent(
 		content = append(content, *extraParams.additionalNodes...)
 	}
 
-	if buttonType := getButtonTypeFromMessage(message); buttonType != "" {
+	// Use createButtonNode for correct button/list/interactive biz nodes
+	buttonContent := createButtonNode(message)
+	if buttonContent != nil {
 		content = append(content, waBinary.Node{
-			Tag: "biz",
-			Content: []waBinary.Node{{
-				Tag:   buttonType,
-				Attrs: getButtonAttributes(message),
-			}},
+			Tag:     "biz",
+			Attrs:   getButtonBizNodeAttrs(message),
+			Content: buttonContent,
 		})
 	}
 	return content
+}
+
+// createButtonNode creates the correct biz node content for buttons, lists, and interactive messages.
+// This matches the Baileys implementation for proper WhatsApp server handling.
+func createButtonNode(message *waE2E.Message) []waBinary.Node {
+	// Unwrap ViewOnceMessage
+	if message.ViewOnceMessage != nil {
+		return createButtonNode(message.ViewOnceMessage.Message)
+	}
+	if message.ViewOnceMessageV2 != nil {
+		return createButtonNode(message.ViewOnceMessageV2.Message)
+	}
+
+	if message.ListMessage != nil {
+		return []waBinary.Node{
+			{
+				Tag: "list",
+				Attrs: waBinary.Attrs{
+					"v":    "2",
+					"type": "single_select",
+				},
+			},
+		}
+	}
+
+	if message.ButtonsMessage != nil || (message.InteractiveMessage != nil && message.InteractiveMessage.GetNativeFlowMessage() != nil) {
+		interactiveAttrs := waBinary.Attrs{
+			"type": "native_flow",
+			"v":    "1",
+		}
+		nativeFlowAttrs := waBinary.Attrs{
+			"v":    "9",
+			"name": "mixed",
+		}
+
+		if nfm := message.GetInteractiveMessage().GetNativeFlowMessage(); nfm != nil && len(nfm.GetButtons()) > 0 {
+			firstName := nfm.GetButtons()[0].GetName()
+			switch firstName {
+			case "payment_info":
+				nativeFlowAttrs["name"] = "payment_info"
+				nativeFlowAttrs["v"] = "2"
+			case "review_and_pay":
+				nativeFlowAttrs["name"] = "review_and_pay"
+				nativeFlowAttrs["v"] = "2"
+			case "mpm", "cta_catalog", "send_location", "call_permission_request":
+				nativeFlowAttrs["name"] = firstName
+				nativeFlowAttrs["v"] = "2"
+			}
+		}
+
+		return []waBinary.Node{
+			{
+				Tag:   "interactive",
+				Attrs: interactiveAttrs,
+				Content: []waBinary.Node{
+					{
+						Tag:   "native_flow",
+						Attrs: nativeFlowAttrs,
+					},
+				},
+			},
+		}
+	}
+
+	return nil
+}
+
+// getButtonBizNodeAttrs returns extra attributes for the biz node based on button type.
+func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
+	if message == nil {
+		return waBinary.Attrs{}
+	}
+	// Unwrap
+	if message.ViewOnceMessage != nil {
+		return getButtonBizNodeAttrs(message.ViewOnceMessage.Message)
+	}
+	nfm := message.GetInteractiveMessage().GetNativeFlowMessage()
+	if nfm == nil || len(nfm.GetButtons()) == 0 {
+		return waBinary.Attrs{}
+	}
+	switch nfm.GetButtons()[0].GetName() {
+	case "payment_info":
+		return waBinary.Attrs{
+			"native_flow_name":  "payment_info",
+			"experimental_flag": "1",
+		}
+	case "review_and_pay":
+		return waBinary.Attrs{
+			"native_flow_name":  "order_details",
+			"experimental_flag": "1",
+		}
+	default:
+		return waBinary.Attrs{}
+	}
 }
 
 func (cli *Client) prepareMessageNode(
