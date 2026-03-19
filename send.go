@@ -1457,3 +1457,104 @@ func wrapInteractiveForIOS(msg *waE2E.Message) *waE2E.Message {
 		},
 	}
 }
+
+// BuildButtonMessage creates a message with interactive buttons.
+func (cli *Client) BuildButtonMessage(text string, buttons []*waE2E.ButtonsMessage_Button, footer string) *waE2E.Message {
+	headerType := waE2E.ButtonsMessage_EMPTY
+	if text != "" {
+		headerType = waE2E.ButtonsMessage_TEXT
+	}
+
+	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
+	for i, btn := range buttons {
+		processedButtons[i] = &waE2E.ButtonsMessage_Button{
+			ButtonID:   btn.ButtonID,
+			ButtonText: btn.ButtonText,
+			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+		}
+	}
+
+	return &waE2E.Message{
+		ButtonsMessage: &waE2E.ButtonsMessage{
+			ContentText: proto.String(text),
+			FooterText:  proto.String(footer),
+			Buttons:     processedButtons,
+			HeaderType:  headerType.Enum(),
+			Header: &waE2E.ButtonsMessage_Text{
+				Text: text,
+			},
+		},
+	}
+}
+
+// BuildButtonMessageWithMedia creates a media message with interactive buttons.
+func (cli *Client) BuildButtonMessageWithMedia(
+	mediaMessage *waE2E.Message,
+	caption string,
+	buttons []*waE2E.ButtonsMessage_Button,
+	footer string,
+	headerType waE2E.ButtonsMessage_HeaderType,
+) *waE2E.Message {
+	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
+	for i, btn := range buttons {
+		processedButtons[i] = &waE2E.ButtonsMessage_Button{
+			ButtonID:   btn.ButtonID,
+			ButtonText: btn.ButtonText,
+			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+		}
+	}
+
+	buttonsMsg := &waE2E.ButtonsMessage{
+		ContentText: proto.String(caption),
+		FooterText:  proto.String(footer),
+		Buttons:     processedButtons,
+		HeaderType:  headerType.Enum(),
+	}
+
+	switch {
+	case mediaMessage.ImageMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
+			ImageMessage: mediaMessage.ImageMessage,
+		}
+	case mediaMessage.VideoMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
+			VideoMessage: mediaMessage.VideoMessage,
+		}
+	case mediaMessage.DocumentMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_DocumentMessage{
+			DocumentMessage: mediaMessage.DocumentMessage,
+		}
+	case mediaMessage.LocationMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_LocationMessage{
+			LocationMessage: mediaMessage.LocationMessage,
+		}
+	default:
+		return nil
+	}
+
+	return &waE2E.Message{
+		ButtonsMessage: buttonsMsg,
+	}
+}
+
+// BuildTemplateMessage creates a message with template buttons (URL, Call, QuickReply).
+func (cli *Client) BuildTemplateMessage(
+	text string,
+	templateButtons []*waE2E.HydratedTemplateButton,
+	footer string,
+) *waE2E.Message {
+	hydratedTemplate := &waE2E.TemplateMessage_HydratedFourRowTemplate{
+		HydratedContentText: proto.String(text),
+		HydratedFooterText:  proto.String(footer),
+		HydratedButtons:     templateButtons,
+	}
+
+	return &waE2E.Message{
+		TemplateMessage: &waE2E.TemplateMessage{
+			Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{
+				HydratedFourRowTemplate: hydratedTemplate,
+			},
+			HydratedTemplate: hydratedTemplate,
+		},
+	}
+}
