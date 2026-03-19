@@ -1425,6 +1425,14 @@ func wrapInteractiveForIOS(msg *waE2E.Message) *waE2E.Message {
 		return msg
 	}
 
+	// Fix ListMessage listType bug: Baileys/whatsmeow sometimes encodes SINGLE_SELECT
+	// as PRODUCT_LIST which breaks rendering on all clients.
+	if msg.ListMessage != nil {
+		if msg.ListMessage.GetListType() == waE2E.ListMessage_PRODUCT_LIST {
+			msg.ListMessage.ListType = waE2E.ListMessage_SINGLE_SELECT.Enum()
+		}
+	}
+
 	// Already wrapped — don't double-wrap
 	if msg.ViewOnceMessage != nil || msg.ViewOnceMessageV2 != nil {
 		return msg
