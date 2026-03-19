@@ -220,6 +220,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.ID = req.ID
 
+	// Auto-wrap ButtonsMessage and ListMessage in ViewOnceMessage for iOS compatibility.
+	// iPhone ignores bare ButtonsMessage/ListMessage but renders them inside ViewOnceMessage.
+	message = wrapInteractiveForIOS(message)
+
 	isInlineBotMode := false
 
 	if !req.InlineBotJID.IsEmpty() {
@@ -1409,4 +1413,39 @@ func (cli *Client) encryptMessageForDevice(
 		Attrs:   encAttrs,
 		Content: ciphertext.Serialize(),
 	}, includeDeviceIdentity, nil
+}
+
+// wrapInteractiveForIOS wraps ButtonsMessage and ListMessage in a ViewOnceMessage
+// so that they render correctly on iOS devices. Without this wrapper, iPhone clients
+// silently ignore these message types.
+//
+// Messages already wrapped in ViewOnceMessage/ViewOnceMessageV2 are left unchanged.
+func wrapInteractiveForIOS(msg *waE2E.Message) *waE2E.Message {
+	if msg == nil {
+		return msg
+	}
+
+	// Already wrapped — don't double-wrap
+	if msg.ViewOnceMessage != nil || msg.ViewOnceMessageV2 != nil {
+		return msg
+	}
+
+	needsWrap := false
+
+	switch {
+	case msg.ButtonsMessage != nil:
+		needsWrap = true
+	case msg.ListMessage != nil:
+		needsWrap = true
+	}
+
+	if !needsWrap {
+		return msg
+	}
+
+	return &waE2E.Message{
+		ViewOnceMessage: &waE2E.FutureProofMessage{
+			Message: msg,
+		},
+	}
 }
