@@ -53,7 +53,7 @@ func (cli *Client) getMessageReportingToken(
 	messageID types.MessageID,
 ) waBinary.Node {
 	reportingSecret, _ := generateMsgSecretKey(
-		EncSecretReportToken, remoteJID, messageID, senderJID,
+		EncSecretReportToken, senderJID, messageID, remoteJID,
 		msg.GetMessageContextInfo().GetMessageSecret(),
 	)
 	hasher := hmac.New(sha256.New, reportingSecret)

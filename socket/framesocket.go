@@ -97,13 +97,16 @@ func (fs *FrameSocket) Connect(ctx context.Context) error {
 	fs.cancelCtx, fs.cancel = context.WithCancel(ctx)
 
 	fs.log.Debugf("Dialing %s", fs.URL)
-	conn, resp, err := websocket.Dial(ctx, fs.URL, fs.makeDialOptions())
+	conn, resp, err := websocket.Dial(ctx, fs.URL, &websocket.DialOptions{
+		HTTPClient: fs.HTTPClient,
+		HTTPHeader: fs.HTTPHeaders,
+	})
 	if err != nil {
 		if resp != nil {
 			err = ErrWithStatusCode{err, resp.StatusCode}
 		}
 		fs.cancel()
-		return fmt.Errorf("%w: %w", ErrDialFailed, err)
+		return fmt.Errorf("failed to dial whatsapp web websocket: %w", err)
 	}
 	conn.SetReadLimit(FrameMaxSize)
 
