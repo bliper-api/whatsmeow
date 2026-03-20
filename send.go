@@ -228,6 +228,18 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		}
 	}
 
+	// CRITICAL: Wrap ButtonsMessage, ListMessage, and InteractiveMessage in
+	// DocumentWithCaptionMessage for multi-device compatibility.
+	// Without this wrapper, WhatsApp returns error 405.
+	// This matches Baileys' patchMessageForMdIfRequired() function.
+	if message.ButtonsMessage != nil || message.ListMessage != nil || message.InteractiveMessage != nil {
+		message = &waE2E.Message{
+			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
+				Message: message,
+			},
+		}
+	}
+
 	isInlineBotMode := false
 
 	if !req.InlineBotJID.IsEmpty() {
@@ -1135,6 +1147,8 @@ func (cli *Client) getMessageContent(
 // Copied from whatsmeow_funcionando/send.go.
 func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
 	switch {
+	case msg.DocumentWithCaptionMessage != nil:
+		return getButtonAttributes(msg.DocumentWithCaptionMessage.Message)
 	case msg.ViewOnceMessage != nil:
 		return getButtonAttributes(msg.ViewOnceMessage.Message)
 	case msg.ViewOnceMessageV2 != nil:
@@ -1160,6 +1174,11 @@ func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
 // createButtonNode creates the correct biz node content for buttons, lists, and interactive messages.
 // Copied from whatsmeow_funcionando/send.go - NO ViewOnceMessage unwrapping.
 func createButtonNode(message *waE2E.Message) []waBinary.Node {
+	// Unwrap DocumentWithCaptionMessage (used by patchMessageForMdIfRequired)
+	if message.DocumentWithCaptionMessage != nil {
+		return createButtonNode(message.DocumentWithCaptionMessage.Message)
+	}
+
 	if message.ListMessage != nil {
 		attrs := getButtonAttributes(message)
 		return []waBinary.Node{
@@ -1216,6 +1235,9 @@ func createButtonNode(message *waE2E.Message) []waBinary.Node {
 func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
 	if message == nil {
 		return waBinary.Attrs{}
+	}
+	if message.DocumentWithCaptionMessage != nil {
+		return getButtonBizNodeAttrs(message.DocumentWithCaptionMessage.Message)
 	}
 	nfm := message.GetInteractiveMessage().GetNativeFlowMessage()
 	if nfm == nil || len(nfm.GetButtons()) == 0 {
