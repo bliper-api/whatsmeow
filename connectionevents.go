@@ -160,10 +160,7 @@ func (cli *Client) handleConnectSuccess(ctx context.Context, node *waBinary.Node
 	cli.LastSuccessfulConnect = time.Now()
 	cli.AutoReconnectErrors = 0
 	cli.isLoggedIn.Store(true)
-	ag := node.AttrGetter()
-	nodeLID := ag.JID("lid")
-	cli.serverTimeOffset.Store(int64(ag.UnixTime("t").Sub(time.Now().Round(time.Second))))
-
+	nodeLID := node.AttrGetter().JID("lid")
 	if !cli.Store.LID.IsEmpty() && !nodeLID.IsEmpty() && cli.Store.LID != nodeLID {
 		// This should probably never happen, but check just in case.
 		cli.Log.Warnf("Stored LID doesn't match one in connect success: %s != %s", cli.Store.LID, nodeLID)

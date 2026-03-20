@@ -220,26 +220,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.ID = req.ID
 
-	// Fix ListMessage listType bug: Baileys/whatsmeow sometimes encodes SINGLE_SELECT
-	// as PRODUCT_LIST which breaks rendering on all clients.
-	if message.ListMessage != nil {
-		if message.ListMessage.GetListType() == waE2E.ListMessage_PRODUCT_LIST {
-			message.ListMessage.ListType = waE2E.ListMessage_SINGLE_SELECT.Enum()
-		}
-	}
-
-	// CRITICAL: Wrap ButtonsMessage, ListMessage, and InteractiveMessage in
-	// DocumentWithCaptionMessage for multi-device compatibility.
-	// Without this wrapper, WhatsApp returns error 405.
-	// This matches Baileys' patchMessageForMdIfRequired() function.
-	if message.ButtonsMessage != nil || message.ListMessage != nil || message.InteractiveMessage != nil {
-		message = &waE2E.Message{
-			DocumentWithCaptionMessage: &waE2E.FutureProofMessage{
-				Message: message,
-			},
-		}
-	}
-
 	isInlineBotMode := false
 
 	if !req.InlineBotJID.IsEmpty() {
@@ -342,7 +322,7 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 		resp.DebugTimings.GetParticipants = time.Since(start)
 	} else if to.Server == types.HiddenUserServer {
 		ownID = cli.getOwnLID()
-	} else if to.Server == types.DefaultUserServer && cli.Store.LIDMigrationTimestamp > 0 && !req.Peer {
+	} else if to.Server == types.DefaultUserServer && cli.Store.LIDMigrationTimestamp > 0 {
 		start := time.Now()
 		var toLID types.JID
 		toLID, err = cli.Store.LIDs.GetLIDForPN(ctx, to)
@@ -393,12 +373,10 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	resp.DebugTimings.Queue = time.Since(start)
 	defer cli.messageSendLock.Unlock()
 
+	respChan := cli.waitResponse(req.ID)
 	// Peer message retries aren't implemented yet
 	if !req.Peer {
-		err = cli.addRecentMessage(ctx, to, req.ID, message, nil)
-		if err != nil {
-			return
-		}
+		cli.addRecentMessage(to, req.ID, message, nil)
 	}
 
 	if message.GetMessageContextInfo().GetMessageSecret() != nil {
@@ -409,8 +387,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 			cli.Log.Debugf("Stored message secret key for outgoing message %s", req.ID)
 		}
 	}
-
-	respChan := cli.waitResponse(req.ID)
 	var phash string
 	var data []byte
 	switch to.Server {
@@ -485,14 +461,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	return
 }
 
-func (cli *Client) SendPeerMessage(ctx context.Context, message *waE2E.Message) (SendResponse, error) {
-	ownID := cli.getOwnID().ToNonAD()
-	if ownID.IsEmpty() {
-		return SendResponse{}, ErrNotLoggedIn
-	}
-	return cli.SendMessage(ctx, ownID, message, SendRequestExtra{Peer: true})
-}
-
 // RevokeMessage deletes the given message from everyone in the chat.
 //
 // This method will wait for the server to acknowledge the revocation message before returning.
@@ -558,7 +526,7 @@ func (cli *Client) BuildReaction(chat, sender types.JID, id types.MessageID, rea
 // BuildUnavailableMessageRequest builds a message to request the user's primary device to send
 // the copy of a message that this client was unable to decrypt.
 //
-// The built message can be sent using Client.SendPeerMessage.
+// The built message can be sent using Client.SendMessage, but you must pass whatsmeow.SendRequestExtra{Peer: true} as the last parameter.
 // The full response will come as a ProtocolMessage with type `PEER_DATA_OPERATION_REQUEST_RESPONSE_MESSAGE`.
 // The response events will also be dispatched as normal *events.Message's with UnavailableRequestID set to the request message ID.
 func (cli *Client) BuildUnavailableMessageRequest(chat, sender types.JID, id string) *waE2E.Message {
@@ -577,7 +545,7 @@ func (cli *Client) BuildUnavailableMessageRequest(chat, sender types.JID, id str
 
 // BuildHistorySyncRequest builds a message to request additional history from the user's primary device.
 //
-// The built message can be sent using Client.SendPeerMessage.
+// The built message can be sent using Client.SendMessage, but you must pass whatsmeow.SendRequestExtra{Peer: true} as the last parameter.
 // The response will come as an *events.HistorySync with type `ON_DEMAND`.
 //
 // The response will contain to `count` messages immediately before the given message.
@@ -624,6 +592,172 @@ func (cli *Client) BuildEdit(chat types.JID, id types.MessageID, newContent *waE
 					TimestampMS:   proto.Int64(time.Now().UnixMilli()),
 				},
 			},
+		},
+	}
+}
+
+// BuildButtonMessage cria uma mensagem com botões interativos.
+// O built message can be sent normally using Client.SendMessage.
+//
+//	buttons := []*waE2E.ButtonsMessage_Button{
+//		{
+//			ButtonID: proto.String("id1"),
+//			ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
+//				DisplayText: proto.String("Button 1"),
+//			},
+//		},
+//		{
+//			ButtonID: proto.String("id2"),
+//			ButtonText: &waE2E.ButtonsMessage_Button_ButtonText{
+//				DisplayText: proto.String("Button 2"),
+//			},
+//		},
+//	}
+//	msg := cli.BuildButtonMessage("Hi it's button message", buttons, "Hello World")
+//	resp, err := cli.SendMessage(context.Background(), targetJID, msg)
+func (cli *Client) BuildButtonMessage(text string, buttons []*waE2E.ButtonsMessage_Button, footer string) *waE2E.Message {
+	headerType := waE2E.ButtonsMessage_EMPTY
+	if text != "" {
+		headerType = waE2E.ButtonsMessage_TEXT
+	}
+
+	// Garantir que todos os botões tenham tipo RESPONSE
+	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
+	for i, btn := range buttons {
+		processedButtons[i] = &waE2E.ButtonsMessage_Button{
+			ButtonID:   btn.ButtonID,
+			ButtonText: btn.ButtonText,
+			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+		}
+	}
+
+	return &waE2E.Message{
+		ButtonsMessage: &waE2E.ButtonsMessage{
+			ContentText: proto.String(text),
+			FooterText:  proto.String(footer),
+			Buttons:     processedButtons,
+			HeaderType:  headerType.Enum(),
+			Header: &waE2E.ButtonsMessage_Text{
+				Text: text,
+			},
+		},
+	}
+}
+
+// BuildButtonMessageWithMedia cria uma mensagem de mídia com botões interativos.
+// O built message can be sent normally using Client.SendMessage.
+//
+// Primeiro, crie a mensagem de mídia normalmente (usando Upload para imagens/vídeos, etc),
+// depois use esta função para adicionar botões.
+//
+//	// Primeiro, faça upload da imagem
+//	imageMsg := &waE2E.Message{ImageMessage: ...}
+//	// Depois, adicione botões
+//	buttons := []*waE2E.ButtonsMessage_Button{...}
+//	msg := cli.BuildButtonMessageWithMedia(imageMsg, "Caption with buttons", buttons, "Footer", waE2E.ButtonsMessage_IMAGE)
+//	resp, err := cli.SendMessage(context.Background(), targetJID, msg)
+func (cli *Client) BuildButtonMessageWithMedia(
+	mediaMessage *waE2E.Message,
+	caption string,
+	buttons []*waE2E.ButtonsMessage_Button,
+	footer string,
+	headerType waE2E.ButtonsMessage_HeaderType,
+) *waE2E.Message {
+	// Processar botões
+	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
+	for i, btn := range buttons {
+		processedButtons[i] = &waE2E.ButtonsMessage_Button{
+			ButtonID:   btn.ButtonID,
+			ButtonText: btn.ButtonText,
+			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
+		}
+	}
+
+	buttonsMsg := &waE2E.ButtonsMessage{
+		ContentText: proto.String(caption),
+		FooterText:  proto.String(footer),
+		Buttons:     processedButtons,
+		HeaderType:  headerType.Enum(),
+	}
+
+	// Extrair e atribuir a mensagem de mídia (image, video, document, etc) como header
+	switch {
+	case mediaMessage.ImageMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
+			ImageMessage: mediaMessage.ImageMessage,
+		}
+	case mediaMessage.VideoMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
+			VideoMessage: mediaMessage.VideoMessage,
+		}
+	case mediaMessage.DocumentMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_DocumentMessage{
+			DocumentMessage: mediaMessage.DocumentMessage,
+		}
+	case mediaMessage.LocationMessage != nil:
+		buttonsMsg.Header = &waE2E.ButtonsMessage_LocationMessage{
+			LocationMessage: mediaMessage.LocationMessage,
+		}
+	default:
+		return nil // Tipo de mídia não suportado
+	}
+
+	return &waE2E.Message{
+		ButtonsMessage: buttonsMsg,
+	}
+}
+
+// BuildTemplateMessage cria uma mensagem com template buttons (botões de URL, chamada e resposta rápida).
+// O built message can be sent normally using Client.SendMessage.
+//
+//	templateButtons := []*waE2E.HydratedTemplateButton{
+//		{
+//			Index: proto.Uint32(1),
+//			HydratedButton: &waE2E.HydratedTemplateButton_UrlButton{
+//				UrlButton: &waE2E.HydratedTemplateButton_HydratedURLButton{
+//					DisplayText: proto.String("⭐ Star on GitHub!"),
+//					Url:         proto.String("https://github.com/..."),
+//				},
+//			},
+//		},
+//		{
+//			Index: proto.Uint32(2),
+//			HydratedButton: &waE2E.HydratedTemplateButton_CallButton{
+//				CallButton: &waE2E.HydratedTemplateButton_HydratedCallButton{
+//					DisplayText: proto.String("Call me!"),
+//					PhoneNumber: proto.String("+1234567890"),
+//				},
+//			},
+//		},
+//		{
+//			Index: proto.Uint32(3),
+//			HydratedButton: &waE2E.HydratedTemplateButton_QuickReplyButton{
+//				QuickReplyButton: &waE2E.HydratedTemplateButton_HydratedQuickReplyButton{
+//					DisplayText: proto.String("Quick Reply"),
+//					Id:          proto.String("quick-reply-id"),
+//				},
+//			},
+//		},
+//	}
+//	msg := cli.BuildTemplateMessage("Hi it's a template message", templateButtons, "Hello World")
+//	resp, err := cli.SendMessage(context.Background(), targetJID, msg)
+func (cli *Client) BuildTemplateMessage(
+	text string,
+	templateButtons []*waE2E.HydratedTemplateButton,
+	footer string,
+) *waE2E.Message {
+	hydratedTemplate := &waE2E.TemplateMessage_HydratedFourRowTemplate{
+		HydratedContentText: proto.String(text),
+		HydratedFooterText:  proto.String(footer),
+		HydratedButtons:     templateButtons,
+	}
+
+	return &waE2E.Message{
+		TemplateMessage: &waE2E.TemplateMessage{
+			Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{
+				HydratedFourRowTemplate: hydratedTemplate,
+			},
+			HydratedTemplate: hydratedTemplate,
 		},
 	}
 }
@@ -1009,6 +1143,134 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 	}
 }
 
+func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
+	switch {
+	case msg.ViewOnceMessage != nil:
+		return getButtonAttributes(msg.ViewOnceMessage.Message)
+	case msg.ViewOnceMessageV2 != nil:
+		return getButtonAttributes(msg.ViewOnceMessageV2.Message)
+	case msg.EphemeralMessage != nil:
+		return getButtonAttributes(msg.EphemeralMessage.Message)
+	case msg.TemplateMessage != nil:
+		return waBinary.Attrs{}
+	case msg.ListMessage != nil:
+		return waBinary.Attrs{
+			"v":    "2",
+			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
+		}
+	case msg.ButtonsMessage != nil:
+		// ButtonsMessage precisa do nó interactive com native_flow
+		return waBinary.Attrs{}
+	case msg.InteractiveMessage != nil && msg.InteractiveMessage.GetNativeFlowMessage() != nil:
+		// InteractiveMessage com nativeFlowMessage também precisa do nó interactive
+		return waBinary.Attrs{}
+	default:
+		return waBinary.Attrs{}
+	}
+}
+
+func createButtonNode(message *waE2E.Message) []waBinary.Node {
+	if message.ListMessage != nil {
+		// Usar getButtonAttributes para obter os atributos corretos baseados no tipo de lista
+		attrs := getButtonAttributes(message)
+		return []waBinary.Node{
+			{
+				Tag:   "list",
+				Attrs: attrs,
+			},
+		}
+	}
+
+	if message.ButtonsMessage != nil || (message.InteractiveMessage != nil && message.InteractiveMessage.GetNativeFlowMessage() != nil) {
+		interactiveAttrs := waBinary.Attrs{
+			"type": "native_flow",
+			"v":    "1",
+		}
+		nativeFlowAttrs := waBinary.Attrs{
+			"v":    "9",
+			"name": "mixed",
+		}
+
+		if nfm := message.GetInteractiveMessage().GetNativeFlowMessage(); nfm != nil && len(nfm.GetButtons()) > 0 {
+			firstName := nfm.GetButtons()[0].GetName()
+			switch firstName {
+			case "payment_info":
+				// PIX/payment flows are stricter on mobile (especially iOS) and may not render
+				// when wrapped as generic mixed native_flow.
+				nativeFlowAttrs["name"] = "payment_info"
+				nativeFlowAttrs["v"] = "2"
+			case "review_and_pay":
+				// Official clients advertise order payment flow under order_details.
+				nativeFlowAttrs["name"] = "review_and_pay"
+				nativeFlowAttrs["v"] = "2"
+			case "mpm", "cta_catalog", "send_location", "call_permission_request", "wa_payment_transaction_details", "automated_greeting_message_view_catalog":
+				nativeFlowAttrs["name"] = firstName
+				nativeFlowAttrs["v"] = "2"
+			}
+		}
+
+		return []waBinary.Node{
+			{
+				Tag:   "interactive",
+				Attrs: interactiveAttrs,
+				Content: []waBinary.Node{
+					{
+						Tag:   "native_flow",
+						Attrs: nativeFlowAttrs,
+					},
+				},
+			},
+		}
+	}
+
+	return nil
+}
+
+func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
+	if message == nil {
+		return waBinary.Attrs{}
+	}
+	nfm := message.GetInteractiveMessage().GetNativeFlowMessage()
+	if nfm == nil || len(nfm.GetButtons()) == 0 {
+		return waBinary.Attrs{}
+	}
+	switch nfm.GetButtons()[0].GetName() {
+	case "payment_info":
+		return waBinary.Attrs{
+			"native_flow_name":  "payment_info",
+			"experimental_flag": "1",
+		}
+	case "review_and_pay":
+		return waBinary.Attrs{
+			"native_flow_name":  "order_details",
+			"experimental_flag": "1",
+		}
+	default:
+		return waBinary.Attrs{}
+	}
+}
+
+func needsInteractiveButtonBotNode(message *waE2E.Message, msgAttrs waBinary.Attrs) bool {
+	if message == nil {
+		return false
+	}
+	// Only native-flow interactive buttons need this helper node; list/buttons are handled by biz wrapper only.
+	if message.GetInteractiveMessage().GetNativeFlowMessage() == nil {
+		return false
+	}
+
+	toVal, ok := msgAttrs["to"]
+	if !ok {
+		return false
+	}
+	to, ok := toVal.(types.JID)
+	if !ok {
+		return false
+	}
+	// Private chats only. Group/broadcast chats should not include biz_bot node.
+	return to.Server == types.DefaultUserServer || to.Server == types.HiddenUserServer
+}
+
 const RemoveReactionText = ""
 
 func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
@@ -1141,143 +1403,6 @@ func (cli *Client) getMessageContent(
 		cli.Log.Debugf("adding biz node for buttons message")
 	}
 	return content
-}
-
-// getButtonAttributes returns the correct attributes for button/list biz child nodes.
-// Copied from whatsmeow_funcionando/send.go.
-func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
-	switch {
-	case msg.DocumentWithCaptionMessage != nil:
-		return getButtonAttributes(msg.DocumentWithCaptionMessage.Message)
-	case msg.ViewOnceMessage != nil:
-		return getButtonAttributes(msg.ViewOnceMessage.Message)
-	case msg.ViewOnceMessageV2 != nil:
-		return getButtonAttributes(msg.ViewOnceMessageV2.Message)
-	case msg.EphemeralMessage != nil:
-		return getButtonAttributes(msg.EphemeralMessage.Message)
-	case msg.TemplateMessage != nil:
-		return waBinary.Attrs{}
-	case msg.ListMessage != nil:
-		return waBinary.Attrs{
-			"v":    "2",
-			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
-		}
-	case msg.ButtonsMessage != nil:
-		return waBinary.Attrs{}
-	case msg.InteractiveMessage != nil && msg.InteractiveMessage.GetNativeFlowMessage() != nil:
-		return waBinary.Attrs{}
-	default:
-		return waBinary.Attrs{}
-	}
-}
-
-// createButtonNode creates the correct biz node content for buttons, lists, and interactive messages.
-// Copied from whatsmeow_funcionando/send.go - NO ViewOnceMessage unwrapping.
-func createButtonNode(message *waE2E.Message) []waBinary.Node {
-	// Unwrap DocumentWithCaptionMessage (used by patchMessageForMdIfRequired)
-	if message.DocumentWithCaptionMessage != nil {
-		return createButtonNode(message.DocumentWithCaptionMessage.Message)
-	}
-
-	if message.ListMessage != nil {
-		attrs := getButtonAttributes(message)
-		return []waBinary.Node{
-			{
-				Tag:   "list",
-				Attrs: attrs,
-			},
-		}
-	}
-
-	if message.ButtonsMessage != nil || (message.InteractiveMessage != nil && message.InteractiveMessage.GetNativeFlowMessage() != nil) {
-		interactiveAttrs := waBinary.Attrs{
-			"type": "native_flow",
-			"v":    "1",
-		}
-		nativeFlowAttrs := waBinary.Attrs{
-			"v":    "9",
-			"name": "mixed",
-		}
-
-		if nfm := message.GetInteractiveMessage().GetNativeFlowMessage(); nfm != nil && len(nfm.GetButtons()) > 0 {
-			firstName := nfm.GetButtons()[0].GetName()
-			switch firstName {
-			case "payment_info":
-				nativeFlowAttrs["name"] = "payment_info"
-				nativeFlowAttrs["v"] = "2"
-			case "review_and_pay":
-				nativeFlowAttrs["name"] = "review_and_pay"
-				nativeFlowAttrs["v"] = "2"
-			case "mpm", "cta_catalog", "send_location", "call_permission_request", "wa_payment_transaction_details", "automated_greeting_message_view_catalog":
-				nativeFlowAttrs["name"] = firstName
-				nativeFlowAttrs["v"] = "2"
-			}
-		}
-
-		return []waBinary.Node{
-			{
-				Tag:   "interactive",
-				Attrs: interactiveAttrs,
-				Content: []waBinary.Node{
-					{
-						Tag:   "native_flow",
-						Attrs: nativeFlowAttrs,
-					},
-				},
-			},
-		}
-	}
-
-	return nil
-}
-
-// getButtonBizNodeAttrs returns extra attributes for the biz node based on button type.
-func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
-	if message == nil {
-		return waBinary.Attrs{}
-	}
-	if message.DocumentWithCaptionMessage != nil {
-		return getButtonBizNodeAttrs(message.DocumentWithCaptionMessage.Message)
-	}
-	nfm := message.GetInteractiveMessage().GetNativeFlowMessage()
-	if nfm == nil || len(nfm.GetButtons()) == 0 {
-		return waBinary.Attrs{}
-	}
-	switch nfm.GetButtons()[0].GetName() {
-	case "payment_info":
-		return waBinary.Attrs{
-			"native_flow_name":  "payment_info",
-			"experimental_flag": "1",
-		}
-	case "review_and_pay":
-		return waBinary.Attrs{
-			"native_flow_name":  "order_details",
-			"experimental_flag": "1",
-		}
-	default:
-		return waBinary.Attrs{}
-	}
-}
-
-func needsInteractiveButtonBotNode(message *waE2E.Message, msgAttrs waBinary.Attrs) bool {
-	if message == nil {
-		return false
-	}
-	// Only native-flow interactive buttons need this helper node; list/buttons are handled by biz wrapper only.
-	if message.GetInteractiveMessage().GetNativeFlowMessage() == nil {
-		return false
-	}
-
-	toVal, ok := msgAttrs["to"]
-	if !ok {
-		return false
-	}
-	to, ok := toVal.(types.JID)
-	if !ok {
-		return false
-	}
-	// Private chats only. Group/broadcast chats should not include biz_bot node.
-	return to.Server == types.DefaultUserServer || to.Server == types.HiddenUserServer
 }
 
 func (cli *Client) prepareMessageNode(
@@ -1555,105 +1680,4 @@ func (cli *Client) encryptMessageForDevice(
 		Attrs:   encAttrs,
 		Content: ciphertext.Serialize(),
 	}, includeDeviceIdentity, nil
-}
-
-// BuildButtonMessage creates a message with interactive buttons.
-func (cli *Client) BuildButtonMessage(text string, buttons []*waE2E.ButtonsMessage_Button, footer string) *waE2E.Message {
-	headerType := waE2E.ButtonsMessage_EMPTY
-	if text != "" {
-		headerType = waE2E.ButtonsMessage_TEXT
-	}
-
-	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
-	for i, btn := range buttons {
-		processedButtons[i] = &waE2E.ButtonsMessage_Button{
-			ButtonID:   btn.ButtonID,
-			ButtonText: btn.ButtonText,
-			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
-		}
-	}
-
-	return &waE2E.Message{
-		ButtonsMessage: &waE2E.ButtonsMessage{
-			ContentText: proto.String(text),
-			FooterText:  proto.String(footer),
-			Buttons:     processedButtons,
-			HeaderType:  headerType.Enum(),
-			Header: &waE2E.ButtonsMessage_Text{
-				Text: text,
-			},
-		},
-	}
-}
-
-// BuildButtonMessageWithMedia creates a media message with interactive buttons.
-func (cli *Client) BuildButtonMessageWithMedia(
-	mediaMessage *waE2E.Message,
-	caption string,
-	buttons []*waE2E.ButtonsMessage_Button,
-	footer string,
-	headerType waE2E.ButtonsMessage_HeaderType,
-) *waE2E.Message {
-	processedButtons := make([]*waE2E.ButtonsMessage_Button, len(buttons))
-	for i, btn := range buttons {
-		processedButtons[i] = &waE2E.ButtonsMessage_Button{
-			ButtonID:   btn.ButtonID,
-			ButtonText: btn.ButtonText,
-			Type:       waE2E.ButtonsMessage_Button_RESPONSE.Enum(),
-		}
-	}
-
-	buttonsMsg := &waE2E.ButtonsMessage{
-		ContentText: proto.String(caption),
-		FooterText:  proto.String(footer),
-		Buttons:     processedButtons,
-		HeaderType:  headerType.Enum(),
-	}
-
-	switch {
-	case mediaMessage.ImageMessage != nil:
-		buttonsMsg.Header = &waE2E.ButtonsMessage_ImageMessage{
-			ImageMessage: mediaMessage.ImageMessage,
-		}
-	case mediaMessage.VideoMessage != nil:
-		buttonsMsg.Header = &waE2E.ButtonsMessage_VideoMessage{
-			VideoMessage: mediaMessage.VideoMessage,
-		}
-	case mediaMessage.DocumentMessage != nil:
-		buttonsMsg.Header = &waE2E.ButtonsMessage_DocumentMessage{
-			DocumentMessage: mediaMessage.DocumentMessage,
-		}
-	case mediaMessage.LocationMessage != nil:
-		buttonsMsg.Header = &waE2E.ButtonsMessage_LocationMessage{
-			LocationMessage: mediaMessage.LocationMessage,
-		}
-	default:
-		return nil
-	}
-
-	return &waE2E.Message{
-		ButtonsMessage: buttonsMsg,
-	}
-}
-
-// BuildTemplateMessage creates a message with template buttons (URL, Call, QuickReply).
-func (cli *Client) BuildTemplateMessage(
-	text string,
-	templateButtons []*waE2E.HydratedTemplateButton,
-	footer string,
-) *waE2E.Message {
-	hydratedTemplate := &waE2E.TemplateMessage_HydratedFourRowTemplate{
-		HydratedContentText: proto.String(text),
-		HydratedFooterText:  proto.String(footer),
-		HydratedButtons:     templateButtons,
-	}
-
-	return &waE2E.Message{
-		TemplateMessage: &waE2E.TemplateMessage{
-			Format: &waE2E.TemplateMessage_HydratedFourRowTemplate_{
-				HydratedFourRowTemplate: hydratedTemplate,
-			},
-			HydratedTemplate: hydratedTemplate,
-		},
-	}
 }
