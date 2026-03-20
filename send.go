@@ -1333,7 +1333,7 @@ func createButtonNode(message *waE2E.Message) []waBinary.Node {
 		}
 	}
 
-	if message.ButtonsMessage != nil || (message.InteractiveMessage != nil && message.InteractiveMessage.GetNativeFlowMessage() != nil) {
+	if message.ButtonsMessage != nil || (message.InteractiveMessage != nil && (message.InteractiveMessage.GetNativeFlowMessage() != nil || message.InteractiveMessage.GetCarouselMessage() != nil)) {
 		interactiveAttrs := waBinary.Attrs{
 			"type": "native_flow",
 			"v":    "1",
