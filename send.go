@@ -220,14 +220,6 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.ID = req.ID
 
-	// Fix ListMessage listType bug: Baileys/whatsmeow sometimes encodes SINGLE_SELECT
-	// as PRODUCT_LIST which breaks rendering on all clients.
-	if message.ListMessage != nil {
-		if message.ListMessage.GetListType() == waE2E.ListMessage_PRODUCT_LIST {
-			message.ListMessage.ListType = waE2E.ListMessage_SINGLE_SELECT.Enum()
-		}
-	}
-
 	// CRITICAL: Wrap ButtonsMessage, ListMessage, and InteractiveMessage in
 	// DocumentWithCaptionMessage for multi-device compatibility.
 	// Without this wrapper, WhatsApp returns error 405.
@@ -1158,9 +1150,12 @@ func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
 	case msg.TemplateMessage != nil:
 		return waBinary.Attrs{}
 	case msg.ListMessage != nil:
+		// Hardcoded "product_list" like Baileys createButtonNode (messages-send.js:270).
+		// Baileys always uses type="product_list" in the biz node regardless of proto listType.
+		// Using proto-derived "single_select" causes WhatsApp error 405.
 		return waBinary.Attrs{
 			"v":    "2",
-			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
+			"type": "product_list",
 		}
 	case msg.ButtonsMessage != nil:
 		return waBinary.Attrs{}
