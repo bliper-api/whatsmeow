@@ -1537,8 +1537,10 @@ func wrapInteractiveForIOS(msg *waE2E.Message) *waE2E.Message {
 	switch {
 	case msg.ButtonsMessage != nil:
 		needsWrap = true
-	case msg.ListMessage != nil:
-		needsWrap = true
+	// NOTE: ListMessage does NOT need ViewOnceMessage wrapping.
+	// It only needs the <biz><list v="2" type="single_select"/></biz> node
+	// which is handled by createButtonNode(). Wrapping in ViewOnceMessage
+	// causes error 405 on the server.
 	}
 
 	if !needsWrap {
