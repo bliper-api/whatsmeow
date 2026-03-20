@@ -220,9 +220,13 @@ func (cli *Client) SendMessage(ctx context.Context, to types.JID, message *waE2E
 	}
 	resp.ID = req.ID
 
-	// Auto-wrap ButtonsMessage and ListMessage in ViewOnceMessage for iOS compatibility.
-	// iPhone ignores bare ButtonsMessage/ListMessage but renders them inside ViewOnceMessage.
-	message = wrapInteractiveForIOS(message)
+	// Fix ListMessage listType bug: Baileys/whatsmeow sometimes encodes SINGLE_SELECT
+	// as PRODUCT_LIST which breaks rendering on all clients.
+	if message.ListMessage != nil {
+		if message.ListMessage.GetListType() == waE2E.ListMessage_PRODUCT_LIST {
+			message.ListMessage.ListType = waE2E.ListMessage_SINGLE_SELECT.Enum()
+		}
+	}
 
 	isInlineBotMode := false
 
@@ -993,26 +997,6 @@ func getButtonTypeFromMessage(msg *waE2E.Message) string {
 	}
 }
 
-func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
-	switch {
-	case msg.ViewOnceMessage != nil:
-		return getButtonAttributes(msg.ViewOnceMessage.Message)
-	case msg.ViewOnceMessageV2 != nil:
-		return getButtonAttributes(msg.ViewOnceMessageV2.Message)
-	case msg.EphemeralMessage != nil:
-		return getButtonAttributes(msg.EphemeralMessage.Message)
-	case msg.TemplateMessage != nil:
-		return waBinary.Attrs{}
-	case msg.ListMessage != nil:
-		return waBinary.Attrs{
-			"v":    "2",
-			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
-		}
-	default:
-		return waBinary.Attrs{}
-	}
-}
-
 const RemoveReactionText = ""
 
 func getEditAttribute(msg *waE2E.Message) types.EditAttribute {
@@ -1126,7 +1110,7 @@ func (cli *Client) getMessageContent(
 		content = append(content, *extraParams.additionalNodes...)
 	}
 
-	// Use createButtonNode for correct button/list/interactive biz nodes
+	// Usar createButtonNode para criar o nó correto para botões
 	buttonContent := createButtonNode(message)
 	if buttonContent != nil {
 		content = append(content, waBinary.Node{
@@ -1134,29 +1118,54 @@ func (cli *Client) getMessageContent(
 			Attrs:   getButtonBizNodeAttrs(message),
 			Content: buttonContent,
 		})
+		if needsInteractiveButtonBotNode(message, msgAttrs) {
+			content = append(content, waBinary.Node{
+				Tag: "bot",
+				Attrs: waBinary.Attrs{
+					"biz_bot": "1",
+				},
+			})
+		}
+		cli.Log.Debugf("adding biz node for buttons message")
 	}
 	return content
 }
 
-// createButtonNode creates the correct biz node content for buttons, lists, and interactive messages.
-// This matches the Baileys implementation for proper WhatsApp server handling.
-func createButtonNode(message *waE2E.Message) []waBinary.Node {
-	// Unwrap ViewOnceMessage
-	if message.ViewOnceMessage != nil {
-		return createButtonNode(message.ViewOnceMessage.Message)
+// getButtonAttributes returns the correct attributes for button/list biz child nodes.
+// Copied from whatsmeow_funcionando/send.go.
+func getButtonAttributes(msg *waE2E.Message) waBinary.Attrs {
+	switch {
+	case msg.ViewOnceMessage != nil:
+		return getButtonAttributes(msg.ViewOnceMessage.Message)
+	case msg.ViewOnceMessageV2 != nil:
+		return getButtonAttributes(msg.ViewOnceMessageV2.Message)
+	case msg.EphemeralMessage != nil:
+		return getButtonAttributes(msg.EphemeralMessage.Message)
+	case msg.TemplateMessage != nil:
+		return waBinary.Attrs{}
+	case msg.ListMessage != nil:
+		return waBinary.Attrs{
+			"v":    "2",
+			"type": strings.ToLower(waE2E.ListMessage_ListType_name[int32(msg.ListMessage.GetListType())]),
+		}
+	case msg.ButtonsMessage != nil:
+		return waBinary.Attrs{}
+	case msg.InteractiveMessage != nil && msg.InteractiveMessage.GetNativeFlowMessage() != nil:
+		return waBinary.Attrs{}
+	default:
+		return waBinary.Attrs{}
 	}
-	if message.ViewOnceMessageV2 != nil {
-		return createButtonNode(message.ViewOnceMessageV2.Message)
-	}
+}
 
+// createButtonNode creates the correct biz node content for buttons, lists, and interactive messages.
+// Copied from whatsmeow_funcionando/send.go - NO ViewOnceMessage unwrapping.
+func createButtonNode(message *waE2E.Message) []waBinary.Node {
 	if message.ListMessage != nil {
+		attrs := getButtonAttributes(message)
 		return []waBinary.Node{
 			{
-				Tag: "list",
-				Attrs: waBinary.Attrs{
-					"v":    "2",
-					"type": "single_select",
-				},
+				Tag:   "list",
+				Attrs: attrs,
 			},
 		}
 	}
@@ -1180,7 +1189,7 @@ func createButtonNode(message *waE2E.Message) []waBinary.Node {
 			case "review_and_pay":
 				nativeFlowAttrs["name"] = "review_and_pay"
 				nativeFlowAttrs["v"] = "2"
-			case "mpm", "cta_catalog", "send_location", "call_permission_request":
+			case "mpm", "cta_catalog", "send_location", "call_permission_request", "wa_payment_transaction_details", "automated_greeting_message_view_catalog":
 				nativeFlowAttrs["name"] = firstName
 				nativeFlowAttrs["v"] = "2"
 			}
@@ -1208,10 +1217,6 @@ func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
 	if message == nil {
 		return waBinary.Attrs{}
 	}
-	// Unwrap
-	if message.ViewOnceMessage != nil {
-		return getButtonBizNodeAttrs(message.ViewOnceMessage.Message)
-	}
 	nfm := message.GetInteractiveMessage().GetNativeFlowMessage()
 	if nfm == nil || len(nfm.GetButtons()) == 0 {
 		return waBinary.Attrs{}
@@ -1230,6 +1235,27 @@ func getButtonBizNodeAttrs(message *waE2E.Message) waBinary.Attrs {
 	default:
 		return waBinary.Attrs{}
 	}
+}
+
+func needsInteractiveButtonBotNode(message *waE2E.Message, msgAttrs waBinary.Attrs) bool {
+	if message == nil {
+		return false
+	}
+	// Only native-flow interactive buttons need this helper node; list/buttons are handled by biz wrapper only.
+	if message.GetInteractiveMessage().GetNativeFlowMessage() == nil {
+		return false
+	}
+
+	toVal, ok := msgAttrs["to"]
+	if !ok {
+		return false
+	}
+	to, ok := toVal.(types.JID)
+	if !ok {
+		return false
+	}
+	// Private chats only. Group/broadcast chats should not include biz_bot node.
+	return to.Server == types.DefaultUserServer || to.Server == types.HiddenUserServer
 }
 
 func (cli *Client) prepareMessageNode(
@@ -1507,51 +1533,6 @@ func (cli *Client) encryptMessageForDevice(
 		Attrs:   encAttrs,
 		Content: ciphertext.Serialize(),
 	}, includeDeviceIdentity, nil
-}
-
-// wrapInteractiveForIOS wraps ButtonsMessage and ListMessage in a ViewOnceMessage
-// so that they render correctly on iOS devices. Without this wrapper, iPhone clients
-// silently ignore these message types.
-//
-// Messages already wrapped in ViewOnceMessage/ViewOnceMessageV2 are left unchanged.
-func wrapInteractiveForIOS(msg *waE2E.Message) *waE2E.Message {
-	if msg == nil {
-		return msg
-	}
-
-	// Fix ListMessage listType bug: Baileys/whatsmeow sometimes encodes SINGLE_SELECT
-	// as PRODUCT_LIST which breaks rendering on all clients.
-	if msg.ListMessage != nil {
-		if msg.ListMessage.GetListType() == waE2E.ListMessage_PRODUCT_LIST {
-			msg.ListMessage.ListType = waE2E.ListMessage_SINGLE_SELECT.Enum()
-		}
-	}
-
-	// Already wrapped — don't double-wrap
-	if msg.ViewOnceMessage != nil || msg.ViewOnceMessageV2 != nil {
-		return msg
-	}
-
-	needsWrap := false
-
-	switch {
-	case msg.ButtonsMessage != nil:
-		needsWrap = true
-	// NOTE: ListMessage does NOT need ViewOnceMessage wrapping.
-	// It only needs the <biz><list v="2" type="single_select"/></biz> node
-	// which is handled by createButtonNode(). Wrapping in ViewOnceMessage
-	// causes error 405 on the server.
-	}
-
-	if !needsWrap {
-		return msg
-	}
-
-	return &waE2E.Message{
-		ViewOnceMessage: &waE2E.FutureProofMessage{
-			Message: msg,
-		},
-	}
 }
 
 // BuildButtonMessage creates a message with interactive buttons.
